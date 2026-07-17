@@ -1,3 +1,4 @@
+import asyncio
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple, cast
@@ -124,6 +125,21 @@ def _has_client_supplied_mcp_auth(
     mcp_server_auth_headers: Optional[Dict[str, Dict[str, str]]],
 ) -> bool:
     return bool(mcp_auth_header) or bool(mcp_server_auth_headers)
+
+
+MCP_ADMITTED_USER_SUBJECT_METADATA = "mcp_admitted_user_subject"
+"""Marker key stamped into ``UserAPIKeyAuth.metadata`` by ``_reload_admitted_user`` for a
+subject admitted keyless through the gateway session / bridge user path. It is what lets
+``_team_ids_for_mcp_grant`` union the user's teams for exactly those admissions without also
+broadening JWT auth, which produces a structurally identical keyless auth."""
+
+
+def _is_mcp_admitted_user_subject(user_api_key_auth: UserAPIKeyAuth) -> bool:
+    """True when this auth is a keyless subject admitted by the gateway session / bridge user
+    path (stamped at admission), as opposed to a JWT or other keyless auth that merely lacks a
+    ``team_id``."""
+    metadata = user_api_key_auth.metadata
+    return isinstance(metadata, dict) and metadata.get(MCP_ADMITTED_USER_SUBJECT_METADATA) is True
 
 
 def _is_aggregate_mcp_scope(route: str, mcp_servers: list[str] | None) -> bool:
@@ -807,6 +823,7 @@ class MCPRequestHandler:
             org_id=user_object.organization_id,
             object_permission=object_permission,
             object_permission_id=user_object.object_permission_id,
+            metadata={MCP_ADMITTED_USER_SUBJECT_METADATA: True},
         )
 
     @staticmethod
@@ -1590,10 +1607,91 @@ class MCPRequestHandler:
 
     @staticmethod
     async def _get_allowed_mcp_servers_for_team(
-        user_api_key_auth: Optional[UserAPIKeyAuth] = None,
-    ) -> List[str]:
+        user_api_key_auth: UserAPIKeyAuth | None = None,
+    ) -> list[str]:
         """
-        Get allowed MCP servers for a team.
+        Get allowed MCP servers a caller inherits from team membership.
+
+        For a caller with a ``team_id`` (every key-based caller) the result is that one team's
+        grants, byte-identical to before this method learned about multiple teams. For a
+        subject admitted keyless through the gateway DCR session or bridge user path, a
+        ``UserAPIKeyAuth`` can only pin one team while the user may belong to many, so the
+        inherited grant is the UNION across every team the user belongs to. Without this a
+        signed-in user would see only servers granted to them directly and none granted
+        through their teams, which is how servers are meant to be shared (assign teams, not
+        individuals). The union is gated on the admission marker
+        ``_team_ids_for_mcp_grant`` checks, NOT on ``api_key is None``, so JWT auth (also
+        keyless, also possibly team-less) keeps its prior behavior and is not silently
+        broadened.
+        """
+        team_ids = await MCPRequestHandler._team_ids_for_mcp_grant(user_api_key_auth)
+        if not team_ids:
+            return []
+        per_team = await asyncio.gather(
+            *(
+                MCPRequestHandler._allowed_mcp_servers_for_single_team(team_id, user_api_key_auth)
+                for team_id in team_ids
+            )
+        )
+        return list({server for servers in per_team for server in servers})
+
+    @staticmethod
+    async def _team_ids_for_mcp_grant(user_api_key_auth: UserAPIKeyAuth | None) -> list[str]:
+        """The team ids whose MCP grants a caller inherits.
+
+        A caller with an explicit ``team_id`` (every key-based caller, and any auth that pins
+        a team) uses that single team, so key auth is byte-identical. The fan-out to the
+        user's full team list happens ONLY for a subject admitted keyless through the gateway
+        session or bridge user path, which ``_reload_admitted_user`` stamps with
+        ``MCP_ADMITTED_USER_SUBJECT_METADATA``. Gating on that positive marker rather than on
+        ``api_key is None`` is deliberate: JWT auth also produces a keyless ``user_id`` auth
+        with no ``team_id``, and it must keep its prior behavior (no team-inherited grants)
+        rather than silently gaining the union across every team the user belongs to. The
+        ``UI_TEAM_ID`` sentinel resolves to no teams exactly as before."""
+        if user_api_key_auth is None:
+            return []
+        if user_api_key_auth.team_id:
+            return [] if user_api_key_auth.team_id == UI_TEAM_ID else [user_api_key_auth.team_id]
+        if not user_api_key_auth.user_id or not _is_mcp_admitted_user_subject(user_api_key_auth):
+            return []
+        return await MCPRequestHandler._resolve_user_team_ids(user_api_key_auth.user_id, user_api_key_auth)
+
+    @staticmethod
+    async def _resolve_user_team_ids(user_id: str, user_api_key_auth: UserAPIKeyAuth) -> list[str]:
+        """The distinct team ids a user belongs to, from the live user record. Returns [] on
+        no DB, a missing user, or any resolution failure so a lookup blip narrows access
+        rather than raising; the caller's direct grants still apply."""
+        from litellm.proxy.auth.auth_checks import get_user_object
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
+
+        if prisma_client is None:
+            return []
+        try:
+            user_object = await get_user_object(
+                user_id=user_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                user_id_upsert=False,
+                parent_otel_span=user_api_key_auth.parent_otel_span,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+        except Exception as e:  # noqa: BLE001  # a team-resolution blip narrows access, never raises
+            verbose_logger.warning(f"Failed to resolve user teams for MCP grant: {str(e)}")
+            return []
+        if user_object is None or not user_object.teams:
+            return []
+        return list(dict.fromkeys(t for t in user_object.teams if t and t != UI_TEAM_ID))
+
+    @staticmethod
+    async def _allowed_mcp_servers_for_single_team(
+        team_id: str,
+        user_api_key_auth: UserAPIKeyAuth | None,
+    ) -> list[str]:
+        """Allowed MCP servers granted by ONE team.
 
         Unions two sources:
         - Legacy team.object_permission (mcp_servers, mcp_access_groups,
@@ -1617,17 +1715,15 @@ class MCPRequestHandler:
                 user_api_key_cache,
             )
 
-            if user_api_key_auth is None or not user_api_key_auth.team_id or prisma_client is None:
+            if not team_id or team_id == UI_TEAM_ID or prisma_client is None:
                 return []
 
-            if user_api_key_auth.team_id == UI_TEAM_ID:
-                return []
-
-            team_obj: Optional[LiteLLM_TeamTable] = await get_team_object(
-                team_id=user_api_key_auth.team_id,
+            parent_otel_span = user_api_key_auth.parent_otel_span if user_api_key_auth is not None else None
+            team_obj: LiteLLM_TeamTable | None = await get_team_object(
+                team_id=team_id,
                 prisma_client=prisma_client,
                 user_api_key_cache=user_api_key_cache,
-                parent_otel_span=user_api_key_auth.parent_otel_span,
+                parent_otel_span=parent_otel_span,
                 proxy_logging_obj=proxy_logging_obj,
             )
             if team_obj is None:
