@@ -138,7 +138,9 @@ if MCP_AVAILABLE:
         authorize_with_server,
         exchange_token_with_server,
         get_request_base_url,
+        redeem_passthrough_authorization_code,
         register_client_with_server,
+        resolve_ephemeral_dcr_client,
     )
     from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
         global_mcp_server_manager,
@@ -1661,7 +1663,21 @@ if MCP_AVAILABLE:
         mcp_server = await _get_cached_temporary_mcp_server_or_404(server_id, user_api_key_dict, request=request)
         _raise_if_not_oauth2(mcp_server)
         # Use the server's stored client_id when the caller doesn't supply one
-        resolved_client_id = mcp_server.client_id or client_id or ""
+        stored_or_supplied_client_id = mcp_server.client_id or client_id or ""
+        ephemeral_dcr_client = (
+            await resolve_ephemeral_dcr_client(
+                request=request,
+                mcp_server=mcp_server,
+                code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method,
+                redirect_uri=redirect_uri,
+            )
+            if not stored_or_supplied_client_id
+            else None
+        )
+        resolved_client_id = stored_or_supplied_client_id or (
+            ephemeral_dcr_client.client_id if ephemeral_dcr_client else ""
+        )
         if not resolved_client_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1683,6 +1699,7 @@ if MCP_AVAILABLE:
             code_challenge_method=code_challenge_method,
             response_type=response_type,
             scope=scope,
+            ephemeral_dcr_client=ephemeral_dcr_client,
         )
 
     @router.post(
@@ -1705,7 +1722,16 @@ if MCP_AVAILABLE:
     ):
         mcp_server = await _get_cached_temporary_mcp_server_or_404(server_id, user_api_key_dict, request=request)
         _raise_if_not_oauth2(mcp_server)
-        resolved_client_id = mcp_server.client_id or client_id or ""
+        sealed_code = redeem_passthrough_authorization_code(
+            code=code, mcp_server=mcp_server, code_verifier=code_verifier
+        )
+        resolved_code = sealed_code.upstream_code if sealed_code else code
+        # A sealed flow ran the gateway /callback as its upstream redirect (bridge short-circuit
+        # or plain flow alike), so the exchange must present that binding, not the browser page.
+        resolved_redirect_uri = f"{get_request_base_url(request)}/callback" if sealed_code else redirect_uri
+        caller_client_id = sealed_code.client_id if sealed_code else client_id
+        caller_client_secret = sealed_code.client_secret if sealed_code else client_secret
+        resolved_client_id = mcp_server.client_id or caller_client_id or ""
         if not resolved_client_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1721,10 +1747,10 @@ if MCP_AVAILABLE:
             request=request,
             mcp_server=mcp_server,
             grant_type=grant_type,
-            code=code,
-            redirect_uri=redirect_uri,
+            code=resolved_code,
+            redirect_uri=resolved_redirect_uri,
             client_id=resolved_client_id,
-            client_secret=client_secret,
+            client_secret=caller_client_secret,
             code_verifier=code_verifier,
             refresh_token=refresh_token,
             scope=scope,
@@ -1743,6 +1769,12 @@ if MCP_AVAILABLE:
         mcp_server = await _get_cached_temporary_mcp_server_or_404(server_id, user_api_key_dict, request=request)
         request_data = await _read_request_body(request=request)
         data: dict = {**request_data}
+        raw_redirect_uris = data.get("redirect_uris")
+        client_redirect_uris: list[str] | None = (
+            [uri for uri in raw_redirect_uris if isinstance(uri, str) and uri]
+            if isinstance(raw_redirect_uris, list)
+            else None
+        )
 
         return await register_client_with_server(
             request=request,
@@ -1753,6 +1785,7 @@ if MCP_AVAILABLE:
             token_endpoint_auth_method=data.get("token_endpoint_auth_method", ""),
             fallback_client_id=server_id,
             persist_credentials=_user_is_full_admin(user_api_key_dict),
+            client_redirect_uris=client_redirect_uris or None,
         )
 
     @router.delete(
